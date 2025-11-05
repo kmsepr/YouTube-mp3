@@ -12,10 +12,6 @@ from flask import Flask, Response, render_template_string, abort, stream_with_co
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 app = Flask(__name__)
 
-# ==============================================================
-# 🎶 YouTube Playlist Radio SECTION
-# ==============================================================
-
 LOG_PATH = "/mnt/data/radio.log"
 COOKIES_PATH = "/mnt/data/cookies.txt"
 CACHE_FILE = "/mnt/data/playlist_cache.json"
@@ -28,17 +24,35 @@ logging.getLogger().addHandler(handler)
 PLAYLISTS = {
     "kas_ranker": "https://youtube.com/playlist?list=PLS2N6hORhZbuZsS_2u5H_z6oOKDQT1NRZ",
     "ca": "https://youtube.com/playlist?list=PLYKzjRvMAyci_W5xYyIXHBoR63eefUadL",
-    
-    
     "samastha": "https://youtube.com/playlist?list=PLgkREi1Wpr-XgNxocxs3iPj61pqMhi9bv",
+    "hindi_playlist": "https://youtube.com/playlist?list=PLlXSv-ic4-yJj2djMawc8XqqtCn1BVAc2",
+    "eftguru": "https://youtube.com/playlist?list=PLYKzjRvMAycgYvPysx_tiv0q-ZHnDJx0y",
+
+
+"std_10": "https://youtube.com/playlist?list=PLFMb-2_G0bMZMOWz-RvR9dk2Sj0UUnQTZ",
 
 
 
 }
 
+PLAY_MODES = {
+    "kas_ranker": "normal",
+    "ca": "shuffle",
+    "samastha": "shuffle",
+    "hindi_playlist": "shuffle",
+    "eftguru": "shuffle",
+
+    "std_10": "shuffle",
+
+}
+
 STREAMS_RADIO = {}
 MAX_QUEUE = 128
-REFRESH_INTERVAL = 1800  # 30 min
+REFRESH_INTERVAL = 10800  # 3 hr
+
+# ==============================================================
+# 🧩 Playlist Caching + Loader
+# ==============================================================
 
 def load_cache_radio():
     if os.path.exists(CACHE_FILE):
@@ -56,28 +70,55 @@ def save_cache_radio(data):
 
 CACHE_RADIO = load_cache_radio()
 
-def load_playlist_ids_radio(name, force=False):
-    now = time.time()
-    cached = CACHE_RADIO.get(name, {})
-    if not force and cached and now - cached.get("time", 0) < REFRESH_INTERVAL:
-        return cached["ids"]
 
-    url = PLAYLISTS[name]
+def get_playlist_ids(url):
+    """Return list of YouTube video IDs from a playlist URL using yt-dlp."""
     try:
-        logging.info(f"[{name}] Refreshing playlist...")
-        res = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "-J", url, "--cookies", COOKIES_PATH],
-            capture_output=True, text=True, check=True
-        )
-        data = json.loads(res.stdout)
-        ids = [e["id"] for e in data.get("entries", []) if "id" in e][::-1]
-        CACHE_RADIO[name] = {"ids": ids, "time": now}
-        save_cache_radio(CACHE_RADIO)
-        logging.info(f"[{name}] Cached {len(ids)} videos.")
-        return ids
+        cmd = [
+            "yt-dlp",
+            "--flat-playlist",
+            "--dump-single-json",
+            "--no-warnings",
+            "--quiet",
+            url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        return [entry["id"] for entry in data.get("entries", []) if "id" in entry]
     except Exception as e:
-        logging.error(f"[{name}] Playlist error: {e}")
-        return cached.get("ids", [])
+        logging.error(f"get_playlist_ids() failed for {url}: {e}")
+        return []
+
+
+def load_playlist_ids_radio(name, url):
+    """Load and cache YouTube playlist IDs with safe mode handling."""
+    try:
+        ids = get_playlist_ids(url)
+        if not ids:
+            logging.warning(f"[{name}] ⚠️ No videos found in playlist — using empty list.")
+            CACHE_RADIO[name] = []
+            save_cache_radio(CACHE_RADIO)
+            return []
+
+        mode = PLAY_MODES.get(name, "normal").lower().strip()
+        if mode == "shuffle":
+            random.shuffle(ids)
+        elif mode == "reverse":
+            ids.reverse()
+
+        CACHE_RADIO[name] = ids
+        save_cache_radio(CACHE_RADIO)
+        logging.info(f"[{name}] Cached {len(ids)} videos in {mode.upper()} mode.")
+        return ids
+
+    except Exception as e:
+        logging.exception(f"[{name}] ❌ Failed to load playlist ({e}) — fallback to normal order.")
+        return CACHE_RADIO.get(name, [])
+
+
+# ==============================================================
+# 🎧 Streaming Worker
+# ==============================================================
 
 def stream_worker_radio(name):
     s = STREAMS_RADIO[name]
@@ -85,7 +126,7 @@ def stream_worker_radio(name):
         try:
             ids = s["IDS"]
             if not ids:
-                ids = load_playlist_ids_radio(name, True)
+                ids = load_playlist_ids_radio(name, PLAYLISTS[name])
                 s["IDS"] = ids
             if not ids:
                 logging.warning(f"[{name}] No playlist ids found; sleeping...")
@@ -99,9 +140,9 @@ def stream_worker_radio(name):
 
             cmd = (
                 f'yt-dlp -f "bestaudio/best" --cookies "{COOKIES_PATH}" '
-                f'--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" '
+                f'--user-agent "Mozilla/5.0" '
                 f'-o - --quiet --no-warnings "{url}" | '
-                f'ffmpeg -loglevel quiet -i pipe:0 -ac 1 -ar 44100 -b:a 64k -f mp3 pipe:1'
+                f'ffmpeg -loglevel quiet -i pipe:0 -ac 1 -ar 44100 -b:a 40k -f mp3 pipe:1'
             )
 
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -110,18 +151,21 @@ def stream_worker_radio(name):
                 chunk = proc.stdout.read(4096)
                 if not chunk:
                     break
-                # 🟢 Instead of skipping when queue is full, block until space
                 while len(s["QUEUE"]) >= MAX_QUEUE:
                     time.sleep(0.05)
                 s["QUEUE"].append(chunk)
 
             proc.wait()
             logging.info(f"[{name}] ✅ Track completed.")
-            time.sleep(2)  # small delay before next video
+            time.sleep(2)
 
         except Exception as e:
             logging.error(f"[{name}] Worker error: {e}")
             time.sleep(5)
+
+# ==============================================================
+# 🌐 Flask Routes
+# ==============================================================
 
 @app.route("/")
 def home():
@@ -135,18 +179,19 @@ a{display:block;color:#0f0;text-decoration:none;border:1px solid #0f0;padding:10
 a:hover{background:#0f0;color:#000}
 </style></head><body>
 <h2>🎶 YouTube Playlist Radio</h2>
+<a href="/mcq">🧠 Go to MCQ Converter</a>
 {% for p in playlists %}
   <a href="/listen/{{p}}">▶ {{p|capitalize}}</a>
 {% endfor %}
 </body></html>"""
     return render_template_string(html, playlists=playlists)
 
+
 @app.route("/listen/<name>")
 def listen_radio_download(name):
     if name not in STREAMS_RADIO:
         abort(404)
     s = STREAMS_RADIO[name]
-
     def gen():
         while True:
             if s["QUEUE"]:
@@ -155,6 +200,7 @@ def listen_radio_download(name):
                 time.sleep(0.05)
     headers = {"Content-Disposition": f"attachment; filename={name}.mp3"}
     return Response(stream_with_context(gen()), mimetype="audio/mpeg", headers=headers)
+
 
 @app.route("/stream/<name>")
 def stream_audio(name):
@@ -169,58 +215,33 @@ def stream_audio(name):
                 time.sleep(0.05)
     return Response(stream_with_context(gen()), mimetype="audio/mpeg")
 
-# ==============================================================
-# 🔀 Playlist Order Control (Add-only, no modification to core)
-# ==============================================================
-PLAYLIST_ORDER = {name: "normal" for name in PLAYLISTS}  # store current mode
+def cache_refresher():
+    while True:
+        for name, url in PLAYLISTS.items():
+            last = STREAMS_RADIO[name]["LAST_REFRESH"]
+            if time.time() - last > REFRESH_INTERVAL:
+                logging.info(f"[{name}] 🔁 Refreshing playlist cache...")
+                STREAMS_RADIO[name]["IDS"] = load_playlist_ids_radio(name, url)
+                STREAMS_RADIO[name]["LAST_REFRESH"] = time.time()
+        time.sleep(1800)
 
-def reorder_playlist(name, mode="normal"):
-    """Reorder playlist entries without affecting the cache logic."""
-    if name not in CACHE_RADIO or "ids" not in CACHE_RADIO[name]:
-        return
-    ids = CACHE_RADIO[name]["ids"]
-    if mode == "shuffle":
-        random.shuffle(ids)
-    elif mode == "reverse":
-        ids = list(reversed(ids))
-    CACHE_RADIO[name]["ids"] = ids
-    CACHE_RADIO[name]["time"] = time.time()
-    save_cache_radio(CACHE_RADIO)
-    PLAYLIST_ORDER[name] = mode
-    logging.info(f"[{name}] Playlist set to {mode} mode with {len(ids)} videos.")
-
-@app.route("/mode/<name>/<mode>")
-def set_playlist_mode(name, mode):
-    """Switch between shuffle, reverse, and normal modes."""
-    if name not in PLAYLISTS:
-        abort(404)
-    if mode not in ["shuffle", "reverse", "normal"]:
-        return f"❌ Invalid mode. Use /mode/<name>/shuffle | reverse | normal"
-    reorder_playlist(name, mode)
-    return f"✅ {name} playlist set to {mode} mode."
-
-@app.route("/status")
-def show_status():
-    """Show current playlist modes."""
-    html = "<h3>🎶 Playlist Modes</h3><ul>"
-    for k, v in PLAYLIST_ORDER.items():
-        html += f"<li>{k}: {v}</li>"
-    html += "</ul>"
-    return html
 
 # ==============================================================
 # 🚀 START SERVER
 # ==============================================================
 
 if __name__ == "__main__":
-    for pname in PLAYLISTS:
+    for pname, url in PLAYLISTS.items():
         STREAMS_RADIO[pname] = {
-            "IDS": load_playlist_ids_radio(pname),
+            "IDS": load_playlist_ids_radio(pname, url),
             "INDEX": 0,
             "QUEUE": deque(),
             "LAST_REFRESH": time.time(),
         }
         threading.Thread(target=stream_worker_radio, args=(pname,), daemon=True).start()
 
-    logging.info("🚀 YouTube Playlist Radio server running at http://0.0.0.0:8000")
+    # ✅ Start cache refresher thread properly
+    threading.Thread(target=cache_refresher, daemon=True).start()
+
+    logging.info("🚀 Unified Flask App (Radio + MCQ Converter) running at http://0.0.0.0:8000")
     app.run(host="0.0.0.0", port=8000)
